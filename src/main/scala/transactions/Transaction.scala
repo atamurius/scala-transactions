@@ -9,27 +9,27 @@ import scala.Function.const
 
 sealed trait Transaction[T] {
 
-  private def toIO[R](nextActions: T => IO[R]): IO[R] = this match {
+  private def compile[R](continue: T => IO[R]): IO[R] = this match {
 
     case Action(perform, commit, compensate) =>
       perform.flatMap { t =>
-        nextActions(t).redeemWith(
+        continue(t).redeemWith(
           bind = commit(t).attempt >> IO.pure(_),
           recover = compensate(t).attempt >> IO.raiseError(_)
         )
       }
 
     case ActionChain(first, next) =>
-      first.toIO { a =>
-        next(a).toIO(nextActions)
+      first.compile { a =>
+        next(a).compile(continue)
       }
   }
 
-  def compile: IO[T] = toIO(IO.pure)
+  def compile: IO[T] = compile(IO.pure)
 
   def flatMap[R](f: T => Transaction[R]): Transaction[R] = ActionChain(this, f)
 
-  def map[R](f: T => R): Transaction[R] = ActionChain[T, R](this, t => Action(IO(f(t))))
+  def map[R](f: T => R): Transaction[R] = flatMap { t => Action(IO(f(t))) }
 }
 
 object Transaction {

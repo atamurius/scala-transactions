@@ -1,7 +1,6 @@
 package transactions
 
 import cats.effect.IO
-import cats.implicits._
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.wordspec.AnyWordSpec
 

@@ -1,6 +1,7 @@
 package transactions
 
 import cats.effect.IO
+import cats.implicits._
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.wordspec.AnyWordSpec
 
@@ -31,13 +32,11 @@ class TransactionSpec extends AnyWordSpec with Matchers {
       }
     )
 
-    val transaction1 = ActionChain[Int, Int](
-      set("x", 1),
-      oldX => ActionChain[Int, Int](
-        set("old_x", 42),
-        _ => set("y", oldX + 5)
-      )
-    )
+    val transaction1 = for {
+      oldX  <- set("x", 1)
+      _     <- set("old_x", 42)
+      _     <- set("y", oldX + 5)
+    } yield ()
 
     transaction1.compile.unsafeRunSync()
     values shouldBe Map(
@@ -45,15 +44,13 @@ class TransactionSpec extends AnyWordSpec with Matchers {
       "y" -> 5
     )
 
-    val transaction2 = ActionChain[Int, Int](
-      set("x", 1),
-      oldX => ActionChain[Int, Int](
-        set("unknown", 42),
-        _ => set("y", oldX + 5)
-      )
-    )
+    val transaction2 = for {
+      oldX <- set("x", 1)
+      _ <- set("unknown", 42)
+      _ <- set("y", oldX + 5)
+    } yield ()
 
-    transaction2.compile.attempt.unsafeRunSync() shouldBe a[Left[Throwable, Int]]
+    transaction2.compile.attempt.unsafeRunSync() shouldBe a[Left[Throwable, Unit]]
     values shouldBe Map(
       "x" -> 1,
       "y" -> 5

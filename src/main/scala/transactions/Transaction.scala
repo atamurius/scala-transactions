@@ -1,5 +1,6 @@
 package transactions
 
+import cats._
 import cats.effect._
 import cats.implicits._
 
@@ -25,8 +26,25 @@ sealed trait Transaction[T] {
   }
 
   def compile: IO[T] = toIO(IO.pure)
+
+  def flatMap[R](f: T => Transaction[R]): Transaction[R] = ActionChain(this, f)
+
+  def map[R](f: T => R): Transaction[R] = ActionChain[T, R](this, t => Action(IO(f(t))))
 }
 
+object Transaction {
+
+  implicit object MonadInstance extends Monad[Transaction] {
+    override def pure[A](x: A): Transaction[A] = Action(IO.pure(x))
+
+    override def flatMap[A, B](fa: Transaction[A])(f: A => Transaction[B]): Transaction[B] = fa.flatMap(f)
+
+    override def tailRecM[A, B](a: A)(f: A => Transaction[Either[A, B]]): Transaction[B] = f(a).flatMap {
+      case Left(a) => tailRecM(a)(f)
+      case Right(b) => pure(b)
+    }
+  }
+}
 
 final case class Action[T](
   perform:    IO[T],

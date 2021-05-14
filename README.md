@@ -106,31 +106,31 @@ final case class ActionChain[A, B](
 ```
 
 Ура! Мы получили описание любой транзакции в виде одного шага или  последовательности шагов, например наша изначальная задача будет выглядеть примерно так:
+
 ```scala
 ActionChain(
   saveDataAction(data),
-  file => ActionChain(
-    addFileRefAction(documentId, file),
-    _ => addFileRefAction(fileRegistry, file)
-  )
+  { file => 
+    ActionChain(
+      addFileRefAction(documentId, file),
+      { _ => 
+        addFileRefAction(fileRegistry, file)
+      }
+    )
+  }
 )
 ```
+
 Не идеально, но хотя бы компенсации идут вместе с действиями и их больше не забудешь указать. 
 
 Прекрасно, но нехватает маленькой детали - это только описание транзакции, как ее выполнить?
 
 ### Выполняем транзакцию
-Транзакция у нас описывает разные действия, которые нужно выполнить в виде `IO`, значит чтобы выполнить ее нам нужно собрать все ее части в нужном порядке и  получить одно `IO`, которое уже можно выполнять. Давайте опишем такую сборку в терминах "продолжения" - действия, которое нужно выполнить до завершения  транзакции:
+Так как транзакция сама по себе не выполняет никаких действий, а только описывает  что нужно сделать, то для выполнения транзакции нужно собрать ее части в нужном порядке в одну `IO` операцию.
 
-```scala
-sealed trait Transaction[T] {
-  private def compile[R](continue: T => IO[R]): IO[R]
-  
-  def compile: IO[T] = compile(IO.pure) // тут "продолжения" нет, просто возвращаем результат
-}
-```
+На каждом шаге транзакции у нас нет достаточно информации о том, успешна ли вся транзакция целиком. Поэтому для сборки необходимо "продолжение" - остаток действий до конца транзакции.
 
-Так как наша `Transaction` состоит из звух `case` нам нужно рассмотреть два случая. Если мы хотим выполнить атомарный шаг, то логика следующая:
+Так как наша `Transaction` состоит из звух `case`'ов нам нужно рассмотреть два случая. Если мы хотим выполнить атомарный шаг, то логика следующая:
 1. выполнить действие
 2. если позникла ошибка ничего делать не надо - действие не удалось и не требует
 компенсации
@@ -138,13 +138,15 @@ sealed trait Transaction[T] {
 4. по окончанию транзакции нужно подтвердить дейтсвие или же компенсировать его
 
 ```scala
-private def compile[R](continue: T => IO[R]): IO[R] = this match {
+private def compile[R](restOfTransaction: T => IO[R]): IO[R] = this match {
   case Action(perform, commit, compensate) => perform.flatMap { t =>
-    continue(t).redeemWith(
+    restOfTransaction(t).redeemWith(
       bind = commit(t).attempt >> IO.pure(_),
       recover = compensate(t).attempt >> IO.raiseError(_)
     )
   }
+
+  case ActionChain(first, next) => ???
 }
 ```
 
@@ -153,16 +155,67 @@ private def compile[R](continue: T => IO[R]): IO[R] = this match {
 </spoiler>
 
 Для выполнения составного действия все еще проще - выполняем одно действие, а потом второе:
+
 ```scala
-case ActionChain(first, next) =>
-  first.compile { a =>
-    next(a).compile { t =>
-      continue(t)
+private def compile[R](restOfTransaction: T => IO[R]): IO[R] = this match {
+  case Action(perform, commit, compensate) => ...
+  
+  case ActionChain(first, next) =>
+    first.compile { a =>
+      next(a).compile { t =>
+        restOfTransaction(t)
+      }
     }
-  }
+}
 ```
 
-Теперь после сборки транзакции вместе мы компилируем ее в `IO` и получаем  действие, которое обязательно вызовет `commit`/`compensate` для всех действий, которые успешно выполнились (кроме случаев отмены действия,  которое поддерживается в `IO` и которое мы не будем тут рассматривать).
+Для сборки транзакции целиком нужно просто указать, что больше ничего не осталось:
+
+```scala
+sealed trait Transaction[T] {
+
+  def compile: IO[T] = compile(IO.pure) // "продолжение" -- просто вернуть результат
+}
+```
+
+Теперь после сборки транзакции вместе мы компилируем ее в `IO` и получаем  действие, которое обязательно вызовет `commit`/`compensate` для всех операций, которые успешно выполнились (кроме случаев отмены/прерывания операции в `IO`, но мы не будем тут рассматривать эту возможность).
+
+<spoiler title="Доказательство">
+
+Возможно вы не поверите мне на слово когда я утверждаю, что это решение работает верно. Вы полагаете, что я написал много тестов для проверки? Вовсе нет, всего пару.
+
+Все дело в том, что код в функциональном стиле часто позволяет судить о корректности сам по себе. Давайте попробуем порассуждать:
+
+Во-первых, рассмотрим случай вызова `Action.compile(restOfTransaction)`:
+1. Если `perform` выполнился с ошибкой, то `restOfTransaction` не выполняется (потому что он требует значения типа `T`, которое возвращает `perform` в случае успеха)
+2. Порядок выполнения в методе `compile`: сначала `perform`, потом `restOfTransaction` (из тех же соображений обязательности наличия значения `T`)
+3. Если `perform` выполнился успешно, то обязательно выполнится либо `commit` либо `compensate` после завершения `restOfTransaction` (по контракту `redeemWith`)
+
+Рассуждая так же по отношению к `ActionChain.compile(restOfTransaction)` легко можно видеть, что все конечные `Action`'ы выстраиваются в цепочку, разделенную `compile`'ами:
+
+```
+transaction.compile(restOfTransaction) 
+=== 
+action1.compile(t1 => 
+  action2.compile(t2 =>
+    action3.compile(t3 => ...
+      restOfTransaction(tn))))
+```
+
+например, даже если `ActionChain.first` тоже `ActionChain`:
+
+```
+ActionChain(ActionChain(action1, t1 => action2), t2 => action3).compile(restOfTransaction) >>
+ActionChain(action1, t1 => action2).compile(t2 => action3.compile(restOfTransaction)) >>
+action1.compile(t1 => action2.compile(t2 => action3.compile(restOfTransaction))) []
+```
+
+А исходя из свойств `Action.compile` такая цепочка гарантирует выполнение контракта транзакции:
+1. Действия выполняются по очереди
+2. Если любое действие завершилось ошибкой остальные не выполняются
+3. Если любое действие завершилось успешно после завершения остатка обязательно выполнится либо его `commit` либо его `compensate`
+
+</spoiler>
 
 ### При чем тут монада?
 Проблему мы частично решили:
@@ -249,3 +302,5 @@ val transaction = dataChunks.traverse_ { data =>
 }
 transaction.compile // собирает все действия в одну транзакцию
 ```
+
+Весь код доступен тут: https://github.com/atamurius/scala-transactions

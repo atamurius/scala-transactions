@@ -9,11 +9,11 @@ import scala.Function.const
 
 sealed trait Transaction[T] {
 
-  private def compile[R](continue: T => IO[R]): IO[R] = this match {
+  private def compile[R](restOfTransaction: T => IO[R]): IO[R] = this match {
 
     case Action(perform, commit, compensate) =>
       perform.flatMap { t =>
-        continue(t).redeemWith(
+        restOfTransaction(t).redeemWith(
           bind = commit(t).attempt >> IO.pure(_),
           recover = compensate(t).attempt >> IO.raiseError(_)
         )
@@ -21,7 +21,7 @@ sealed trait Transaction[T] {
 
     case ActionChain(first, next) =>
       first.compile { a =>
-        next(a).compile(continue)
+        next(a).compile(restOfTransaction)
       }
   }
 
